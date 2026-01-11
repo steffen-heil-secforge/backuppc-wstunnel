@@ -35,22 +35,6 @@ contents:
       mode: 0755
 
 scripts:
-  postinstall: |
-    #!/bin/sh
-    systemctl daemon-reload
-    echo ""
-    echo "backuppc-tunnel-server installed."
-    echo ""
-    echo "Next steps:"
-    echo "  1. Initialize CA:  /usr/share/backuppc-tunnel/init-ca.sh /etc/backuppc-tunnel your-domain.com"
-    echo "  2. Register clients: /usr/share/backuppc-tunnel/register-client.sh hostname"
-    echo "  3. Start server:   systemctl enable --now backuppc-tunnel"
-
-  preremove: |
-    #!/bin/sh
-    systemctl stop backuppc-tunnel 2>/dev/null || true
-    systemctl disable backuppc-tunnel 2>/dev/null || true
-
-  postremove: |
-    #!/bin/sh
-    systemctl daemon-reload
+  postinstall: scripts/server-postinstall.sh
+  preremove: scripts/server-preremove.sh
+  postremove: scripts/server-postremove.sh
