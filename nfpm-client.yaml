@@ -1,0 +1,29 @@
+name: backuppc-tunnel-client
+arch: amd64
+platform: linux
+version: ${VERSION}
+maintainer: Steffen Heil <steffen.heil@secforge.de>
+description: BackupPC WebSocket tunnel client for client-initiated backups
+vendor: ""
+homepage: https://github.com/steffen-heil-secforge/backuppc-wstunnel
+license: MIT
+
+depends:
+  - rsync
+
+contents:
+  - src: bin/backuppc-tunnel-client
+    dst: /usr/local/bin/backuppc-tunnel-client
+    file_info:
+      mode: 0755
+
+scripts:
+  postinstall: |
+    #!/bin/sh
+    echo ""
+    echo "backuppc-tunnel-client installed."
+    echo ""
+    echo "Usage:"
+    echo "  1. Get config file (.conf) from your backup server admin"
+    echo "  2. Create rsyncd.conf with modules to back up"
+    echo "  3. Run: backuppc-tunnel-client -config /path/to/client.conf"

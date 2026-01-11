@@ -1,0 +1,30 @@
+@echo off
+REM BackupPC Tunnel Client - Windows
+REM Run backup on demand
+
+setlocal
+
+set CONFIG=%~dp0client.conf
+if not "%~1"=="" set CONFIG=%~1
+
+if not exist "%CONFIG%" (
+    echo Error: Config file not found: %CONFIG%
+    echo Usage: %~nx0 [config-file]
+    echo.
+    echo Get your config file from the BackupPC server admin.
+    pause
+    exit /b 1
+)
+
+echo Starting backup...
+"%~dp0backuppc-tunnel-client.exe" -config "%CONFIG%"
+
+if %ERRORLEVEL% EQU 0 (
+    echo.
+    echo Backup completed successfully.
+) else (
+    echo.
+    echo Backup failed with error code %ERRORLEVEL%
+)
+
+pause

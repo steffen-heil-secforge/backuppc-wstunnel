@@ -1,0 +1,22 @@
+# Binaries
+bin/
+*.exe
+backuppc-tunnel-server
+backuppc-tunnel-client
+cmd/*/backuppc-tunnel-*
+
+# Certificates (sensitive)
+*.pem
+*.crt
+*.key
+*.csr
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,80 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version (e.g., 1.0.0)'
+        required: true
+        default: '1.0.0'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Get version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            VERSION="${GITHUB_REF#refs/tags/v}"
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build binaries
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          LDFLAGS="-s -w -X main.version=${VERSION}"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "$LDFLAGS" -o bin/backuppc-tunnel-server ./cmd/server
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "$LDFLAGS" -o bin/backuppc-tunnel-client ./cmd/client
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags "$LDFLAGS" -o bin/backuppc-tunnel-client.exe ./cmd/client
+
+      - name: Install nfpm
+        run: |
+          curl -sfL https://github.com/goreleaser/nfpm/releases/download/v2.35.3/nfpm_2.35.3_linux_amd64.tar.gz | tar xz -C /usr/local/bin nfpm
+
+      - name: Build server .deb package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          nfpm package -f nfpm-server.yaml -p deb -t bin/
+
+      - name: Build client .deb package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          nfpm package -f nfpm-client.yaml -p deb -t bin/
+
+      - name: Create Windows client zip
+        run: |
+          cd bin
+          zip backuppc-tunnel-client-windows-amd64.zip backuppc-tunnel-client.exe
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-packages
+          path: |
+            bin/*.deb
+            bin/*.zip
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            bin/*.deb
+            bin/*.zip
+          generate_release_notes: true

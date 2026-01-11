@@ -1,0 +1,21 @@
+[Unit]
+Description=BackupPC HTTPS Tunnel Server
+After=network.target backuppc.service
+Wants=backuppc.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/backuppc-tunnel-server
+Restart=always
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=no
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/
+ReadWritePaths=/run /var/log
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

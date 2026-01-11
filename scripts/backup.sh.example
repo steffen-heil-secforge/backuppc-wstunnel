@@ -1,0 +1,18 @@
+#!/bin/bash
+# BackupPC Tunnel Client - Linux
+# Run backup on demand
+
+set -e
+
+CONFIG="${1:-${HOME}/.backuppc-tunnel/client.conf}"
+
+if [ ! -f "$CONFIG" ]; then
+    echo "Error: Config file not found: $CONFIG"
+    echo "Usage: $0 [config-file]"
+    echo ""
+    echo "Get your config file from the BackupPC server admin."
+    exit 1
+fi
+
+echo "Starting backup..."
+backuppc-tunnel-client -config "$CONFIG"
