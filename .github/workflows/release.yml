@@ -43,7 +43,7 @@ jobs:
 
       - name: Install nfpm
         run: |
-          curl -sfL https://github.com/goreleaser/nfpm/releases/download/v2.35.3/nfpm_2.35.3_linux_amd64.tar.gz | tar xz -C /usr/local/bin nfpm
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
 
       - name: Build server .deb package
         env:
