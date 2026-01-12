@@ -32,8 +32,52 @@ var (
 	rsyncMu       sync.Mutex
 	wsMu          sync.Mutex // protects WebSocket writes
 	outputMu      sync.Mutex // protects console output
-	progressShown bool       // true if progress line is currently displayed
+	statusLine    string     // current status line content
+	statusShown   bool       // true if status line is currently displayed
 )
+
+// updateStatus updates the current status line in-place
+func updateStatus(format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	timestamp := time.Now().Format("2006/01/02 15:04:05")
+	line := fmt.Sprintf("%s %s", timestamp, msg)
+
+	outputMu.Lock()
+	defer outputMu.Unlock()
+
+	// Clear current line and print new status
+	fmt.Printf("\r%-80s\r%s", "", line)
+	statusLine = line
+	statusShown = true
+}
+
+// finalizeStatus prints the current status as final (with newline) and clears state
+func finalizeStatus() {
+	outputMu.Lock()
+	defer outputMu.Unlock()
+
+	if statusShown {
+		fmt.Println() // Move to next line
+		statusShown = false
+		statusLine = ""
+	}
+}
+
+// printLine prints a complete line (finalizes any status first)
+func printLine(format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	timestamp := time.Now().Format("2006/01/02 15:04:05")
+
+	outputMu.Lock()
+	defer outputMu.Unlock()
+
+	if statusShown {
+		fmt.Printf("\r%-80s\r", "") // Clear status line
+		statusShown = false
+		statusLine = ""
+	}
+	fmt.Printf("%s %s\n", timestamp, msg)
+}
 
 var (
 	serverAddr  string
@@ -120,7 +164,7 @@ func main() {
 
 	// Connect to server
 	u := url.URL{Scheme: "wss", Host: serverAddr, Path: "/tunnel"}
-	log.Printf("Connecting to %s", u.String())
+	updateStatus("Connecting to %s...", u.String())
 
 	dialer := websocket.Dialer{
 		TLSClientConfig:  tlsConfig,
@@ -129,6 +173,7 @@ func main() {
 
 	ws, resp, err := dialer.Dial(u.String(), nil)
 	if err != nil {
+		finalizeStatus()
 		if resp != nil {
 			log.Fatalf("Connection failed: %v (HTTP %d)", err, resp.StatusCode)
 		}
@@ -136,7 +181,8 @@ func main() {
 	}
 	defer ws.Close()
 
-	log.Println("Connected to server, backup will start automatically")
+	updateStatus("Connected to %s", u.String())
+	finalizeStatus()
 
 	// Start progress display
 	stopProgress := make(chan struct{})
@@ -159,15 +205,17 @@ func main() {
 	case err := <-done:
 		close(stopProgress)
 		if err != nil {
-			log.Printf("Backup failed: %v", err)
+			finalizeStatus()
+			printLine("Backup failed: %v", err)
 			os.Exit(1)
 		}
-		log.Printf("Backup completed successfully (sent %s, received %s)",
-			formatBytes(atomic.LoadUint64(&bytesSent)),
-			formatBytes(atomic.LoadUint64(&bytesReceived)))
+		// Replace progress line with final message
+		updateStatus("Done")
+		finalizeStatus()
 	case sig := <-sigChan:
 		close(stopProgress)
-		log.Printf("Received signal %v, disconnecting", sig)
+		finalizeStatus()
+		printLine("Received signal %v, disconnecting", sig)
 		killRsync()
 		wsMu.Lock()
 		ws.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
@@ -175,7 +223,8 @@ func main() {
 		os.Exit(0)
 	case <-time.After(timeout):
 		close(stopProgress)
-		log.Printf("Timeout after %v", timeout)
+		finalizeStatus()
+		printLine("Timeout after %v", timeout)
 		killRsync()
 		os.Exit(1)
 	}
@@ -195,42 +244,21 @@ func formatBytes(b uint64) string {
 }
 
 func displayProgress(stop chan struct{}) {
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 	start := time.Now()
 
 	for {
 		select {
 		case <-stop:
-			// Clear progress line on exit
-			outputMu.Lock()
-			if progressShown {
-				fmt.Printf("\r%80s\r", "")
-				progressShown = false
-			}
-			outputMu.Unlock()
 			return
 		case <-ticker.C:
 			sent := atomic.LoadUint64(&bytesSent)
 			recv := atomic.LoadUint64(&bytesReceived)
 			elapsed := time.Since(start).Round(time.Second)
-			outputMu.Lock()
-			fmt.Printf("\r[%s] Sent: %s | Received: %s    ", elapsed, formatBytes(sent), formatBytes(recv))
-			progressShown = true
-			outputMu.Unlock()
+			updateStatus("[%s] Total - Sent: %s | Received: %s", elapsed, formatBytes(sent), formatBytes(recv))
 		}
 	}
-}
-
-// logMsg logs a message, clearing the progress line first if needed
-func logMsg(format string, v ...interface{}) {
-	outputMu.Lock()
-	if progressShown {
-		fmt.Printf("\r%80s\r", "") // clear progress line
-		progressShown = false
-	}
-	outputMu.Unlock()
-	log.Printf(format, v...)
 }
 
 func killRsync() {
@@ -262,9 +290,57 @@ const connIDCloseMarker = 255
 
 // rsyncConnection tracks state for a single rsync connection
 type rsyncConnection struct {
-	cmd    *exec.Cmd
-	stdin  io.WriteCloser
-	connID byte
+	cmd          *exec.Cmd
+	stdin        io.WriteCloser
+	connID       byte
+	moduleName   string
+	parseState   int // 0=waiting for version, 1=waiting for module, 2=done
+	parseBuf     []byte
+	bytesRecv    uint64 // bytes received for this connection
+	bytesSent    uint64 // bytes sent for this connection
+	startTime    time.Time
+}
+
+// parseModuleName extracts the module name from rsync protocol data
+// Returns the module name if found, empty string otherwise
+func (c *rsyncConnection) parseModuleName(data []byte) {
+	if c.parseState == 2 {
+		return // Already parsed
+	}
+
+	c.parseBuf = append(c.parseBuf, data...)
+
+	for {
+		// Find newline
+		idx := bytes.IndexByte(c.parseBuf, '\n')
+		if idx == -1 {
+			// Limit buffer size to prevent memory issues
+			if len(c.parseBuf) > 1024 {
+				c.parseState = 2 // Give up
+			}
+			return
+		}
+
+		line := string(c.parseBuf[:idx])
+		c.parseBuf = c.parseBuf[idx+1:]
+
+		switch c.parseState {
+		case 0: // Waiting for version line
+			if strings.HasPrefix(line, "@RSYNCD:") {
+				c.parseState = 1
+			}
+		case 1: // Waiting for module name
+			// Module name is the next non-empty line after version
+			line = strings.TrimSpace(line)
+			if line != "" && !strings.HasPrefix(line, "@") {
+				c.moduleName = line
+				c.parseState = 2
+				// Print module name as permanent line, progress will appear below
+				printLine("Backing up %s (#%d)...", c.moduleName, c.connID)
+				return
+			}
+		}
+	}
 }
 
 func handleConnection(ws *websocket.Conn) error {
@@ -319,29 +395,37 @@ func handleConnection(ws *websocket.Conn) error {
 			return nil, fmt.Errorf("failed to start rsync: %v", err)
 		}
 		if err := assignToProcessGroup(cmd); err != nil {
-			logMsg("Warning: failed to assign rsync to process group: %v", err)
+			printLine("Warning: failed to assign rsync to process group: %v", err)
 		}
 		rsyncMu.Lock()
 		rsyncProcess = cmd.Process
 		rsyncMu.Unlock()
-		logMsg("Started rsync for connection %d", connID)
+		updateStatus("Starting backup (#%d)...", connID)
 
 		conn := &rsyncConnection{
-			cmd:    cmd,
-			stdin:  stdin,
-			connID: connID,
+			cmd:       cmd,
+			stdin:     stdin,
+			connID:    connID,
+			startTime: time.Now(),
 		}
 
 		// Read from rsync stdout and send to WebSocket with connection ID prefix
-		go func() {
+		go func(c *rsyncConnection) {
 			buf := make([]byte, 32*1024)
 			for {
 				n, err := stdout.Read(buf)
 				if err != nil {
 					if err != io.EOF {
-						logMsg("rsync read error: %v", err)
+						printLine("rsync read error: %v", err)
 					}
-					logMsg("rsync connection %d completed", connID)
+					// Log module completion with stats
+					elapsed := time.Since(c.startTime).Round(time.Second)
+					moduleName := c.moduleName
+					if moduleName == "" {
+						moduleName = fmt.Sprintf("module #%d", c.connID)
+					}
+					printLine("Backup of %s complete: sent %s, received %s, duration %s",
+						moduleName, formatBytes(c.bytesSent), formatBytes(c.bytesRecv), elapsed)
 					// Send close signal: [255][connID]
 					wsMu.Lock()
 					ws.SetWriteDeadline(time.Now().Add(30 * time.Second))
@@ -359,6 +443,7 @@ func handleConnection(ws *websocket.Conn) error {
 					return
 				}
 				atomic.AddUint64(&bytesSent, uint64(n))
+				c.bytesSent += uint64(n)
 				// Send with connection ID prefix: [connID][data...]
 				msg := make([]byte, n+1)
 				msg[0] = connID
@@ -368,11 +453,11 @@ func handleConnection(ws *websocket.Conn) error {
 				err = ws.WriteMessage(websocket.BinaryMessage, msg)
 				wsMu.Unlock()
 				if err != nil {
-					logMsg("websocket write error: %v", err)
+					printLine("websocket write error: %v", err)
 					return
 				}
 			}
-		}()
+		}(conn)
 
 		return conn, nil
 	}
@@ -400,11 +485,9 @@ func handleConnection(ws *websocket.Conn) error {
 			// Check for close signal: [255][connID]
 			if data[0] == connIDCloseMarker {
 				if len(data) < 2 {
-					logMsg("Malformed close message from server")
 					continue
 				}
 				closeConnID := data[1]
-				logMsg("Received close signal for connection %d", closeConnID)
 				mu.Lock()
 				if currentConn != nil && currentConn.connID == closeConnID {
 					if currentConn.stdin != nil {
@@ -439,10 +522,18 @@ func handleConnection(ws *websocket.Conn) error {
 			stdin := currentConn.stdin
 			mu.Unlock()
 
+			// Track per-connection bytes received
+			currentConn.bytesRecv += uint64(len(payload))
+
+			// Parse module name from rsync protocol
+			if currentConn.parseState < 2 {
+				currentConn.parseModuleName(payload)
+			}
+
 			// Forward data to rsync stdin
 			if stdin != nil && len(payload) > 0 {
 				if _, err := stdin.Write(payload); err != nil {
-					logMsg("Failed to write to rsync stdin: %v", err)
+					printLine("Failed to write to rsync stdin: %v", err)
 				}
 			}
 

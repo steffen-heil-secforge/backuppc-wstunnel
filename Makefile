@@ -1,6 +1,6 @@
 .PHONY: all server client-linux client-windows clean install
 
-VERSION := 1.0.0
+VERSION := 1.0.1
 LDFLAGS := -ldflags "-s -w -X main.version=$(VERSION)"
 
 all: server client-linux client-windows

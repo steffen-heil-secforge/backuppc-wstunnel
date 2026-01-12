@@ -330,6 +330,15 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 	wsError := make(chan error, 1)
 	tunnelDone := make(chan struct{})
 
+	// Setup pong handler to detect dead clients
+	// Read deadline is set; if no pong received within deadline, read fails
+	const pongTimeout = 30 * time.Second
+	ws.SetReadDeadline(time.Now().Add(pongTimeout))
+	ws.SetPongHandler(func(string) error {
+		ws.SetReadDeadline(time.Now().Add(pongTimeout))
+		return nil
+	})
+
 	// Single WebSocket reader goroutine - runs for entire tunnel lifetime
 	go func() {
 		defer close(wsData)
@@ -347,6 +356,8 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 				}
 				return
 			}
+			// Reset read deadline on any message
+			ws.SetReadDeadline(time.Now().Add(pongTimeout))
 			if msgType == websocket.CloseMessage {
 				select {
 				case wsError <- nil:
