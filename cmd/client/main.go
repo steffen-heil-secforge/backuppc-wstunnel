@@ -255,32 +255,135 @@ func windowsToCygwinPath(winPath string) string {
 	return strings.ReplaceAll(winPath, "\\", "/")
 }
 
+// Protocol constants
+// Data messages: [connID 0-254][data...]
+// Close messages: [255][connID] (2 bytes total)
+const connIDCloseMarker = 255
+
+// rsyncConnection tracks state for a single rsync connection
+type rsyncConnection struct {
+	cmd    *exec.Cmd
+	stdin  io.WriteCloser
+	connID byte
+}
+
 func handleConnection(ws *websocket.Conn) error {
-	var rsyncCmd *exec.Cmd
-	var rsyncStdin io.WriteCloser
-	var rsyncStarted bool
-	var rsyncDone chan struct{}
-	var mu sync.Mutex // protects rsyncStarted and rsyncStdin
+	var currentConn *rsyncConnection
+	var mu sync.Mutex // protects currentConn
 
 	// Cleanup function
 	cleanup := func() {
 		mu.Lock()
-		if rsyncStdin != nil {
-			rsyncStdin.Close()
+		if currentConn != nil && currentConn.stdin != nil {
+			currentConn.stdin.Close()
 		}
 		mu.Unlock()
 		killRsync()
 	}
 	defer cleanup()
 
+	// startRsync starts a new rsync process for the given connection ID
+	startRsync := func(connID byte) (*rsyncConnection, error) {
+		// Find rsync binary and config
+		rsyncBinary := "rsync"
+		configPath := rsyncConfig
+		if runtime.GOOS == "windows" {
+			exePath, err := os.Executable()
+			if err == nil {
+				exeDir := filepath.Dir(exePath)
+				rsyncBinary = filepath.Join(exeDir, "rsync.exe")
+				if !filepath.IsAbs(rsyncConfig) {
+					configPath = filepath.Join(exeDir, rsyncConfig)
+				}
+				configPath = windowsToCygwinPath(configPath)
+			}
+		}
+
+		cmd := exec.Command(rsyncBinary, "--server", "--daemon", "--config", configPath, ".")
+		cmd.Dir = filepath.Dir(rsyncBinary)
+		cmd.Env = append(os.Environ(), "PATH="+filepath.Dir(rsyncBinary)+";"+os.Getenv("PATH"))
+		cmd.Stderr = os.Stderr
+		setupProcessGroup(cmd)
+
+		stdin, err := cmd.StdinPipe()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get rsync stdin: %v", err)
+		}
+
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get rsync stdout: %v", err)
+		}
+
+		if err := cmd.Start(); err != nil {
+			return nil, fmt.Errorf("failed to start rsync: %v", err)
+		}
+		if err := assignToProcessGroup(cmd); err != nil {
+			logMsg("Warning: failed to assign rsync to process group: %v", err)
+		}
+		rsyncMu.Lock()
+		rsyncProcess = cmd.Process
+		rsyncMu.Unlock()
+		logMsg("Started rsync for connection %d", connID)
+
+		conn := &rsyncConnection{
+			cmd:    cmd,
+			stdin:  stdin,
+			connID: connID,
+		}
+
+		// Read from rsync stdout and send to WebSocket with connection ID prefix
+		go func() {
+			buf := make([]byte, 32*1024)
+			for {
+				n, err := stdout.Read(buf)
+				if err != nil {
+					if err != io.EOF {
+						logMsg("rsync read error: %v", err)
+					}
+					logMsg("rsync connection %d completed", connID)
+					// Send close signal: [255][connID]
+					wsMu.Lock()
+					ws.SetWriteDeadline(time.Now().Add(30 * time.Second))
+					ws.WriteMessage(websocket.BinaryMessage, []byte{connIDCloseMarker, connID})
+					wsMu.Unlock()
+					// Clean up
+					mu.Lock()
+					if currentConn != nil && currentConn.connID == connID {
+						if currentConn.stdin != nil {
+							currentConn.stdin.Close()
+						}
+						currentConn = nil
+					}
+					mu.Unlock()
+					return
+				}
+				atomic.AddUint64(&bytesSent, uint64(n))
+				// Send with connection ID prefix: [connID][data...]
+				msg := make([]byte, n+1)
+				msg[0] = connID
+				copy(msg[1:], buf[:n])
+				wsMu.Lock()
+				ws.SetWriteDeadline(time.Now().Add(30 * time.Second))
+				err = ws.WriteMessage(websocket.BinaryMessage, msg)
+				wsMu.Unlock()
+				if err != nil {
+					logMsg("websocket write error: %v", err)
+					return
+				}
+			}
+		}()
+
+		return conn, nil
+	}
+
 	for {
 		ws.SetReadDeadline(time.Now().Add(5 * time.Minute))
 		msgType, data, err := ws.ReadMessage()
 		if err != nil {
 			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-				return nil // Normal close
+				return nil
 			}
-			// "close sent" means we initiated close
 			if strings.Contains(err.Error(), "close sent") {
 				return nil
 			}
@@ -289,117 +392,57 @@ func handleConnection(ws *websocket.Conn) error {
 
 		switch msgType {
 		case websocket.BinaryMessage:
-			// Data from BackupPC, forward to rsync
+			if len(data) < 1 {
+				continue
+			}
 			atomic.AddUint64(&bytesReceived, uint64(len(data)))
 
-			// Loop to handle rsync restart between modules
-			for attempt := 0; attempt < 3; attempt++ {
-				mu.Lock()
-				needStart := !rsyncStarted
-				mu.Unlock()
-
-				if needStart {
-					// Find rsync binary and config
-					rsyncBinary := "rsync"
-					configPath := rsyncConfig
-					if runtime.GOOS == "windows" {
-						exePath, err := os.Executable()
-						if err == nil {
-							exeDir := filepath.Dir(exePath)
-							rsyncBinary = filepath.Join(exeDir, "rsync.exe")
-							// Make config path absolute if relative
-							if !filepath.IsAbs(rsyncConfig) {
-								configPath = filepath.Join(exeDir, rsyncConfig)
-							}
-							// Convert to Cygwin path format to avoid warning
-							configPath = windowsToCygwinPath(configPath)
-						}
-					}
-
-					// Start rsync in server mode with daemon config (stdin/stdout)
-					rsyncCmd = exec.Command(rsyncBinary, "--server", "--daemon", "--config", configPath, ".")
-					rsyncCmd.Dir = filepath.Dir(rsyncBinary) // Set working dir so rsync finds its DLLs
-					rsyncCmd.Env = append(os.Environ(), "PATH="+filepath.Dir(rsyncBinary)+";"+os.Getenv("PATH"))
-					rsyncCmd.Stderr = os.Stderr
-					setupProcessGroup(rsyncCmd)
-
-					rsyncStdin, err = rsyncCmd.StdinPipe()
-					if err != nil {
-						return fmt.Errorf("failed to get rsync stdin: %v", err)
-					}
-
-					rsyncStdout, err := rsyncCmd.StdoutPipe()
-					if err != nil {
-						return fmt.Errorf("failed to get rsync stdout: %v", err)
-					}
-
-					if err := rsyncCmd.Start(); err != nil {
-						return fmt.Errorf("failed to start rsync: %v", err)
-					}
-					if err := assignToProcessGroup(rsyncCmd); err != nil {
-						logMsg("Warning: failed to assign rsync to process group: %v", err)
-					}
-					rsyncMu.Lock()
-					rsyncProcess = rsyncCmd.Process
-					rsyncMu.Unlock()
-					logMsg("Started rsync")
-
-					mu.Lock()
-					rsyncStarted = true
-					rsyncDone = make(chan struct{})
-					currentDone := rsyncDone
-					currentStdin := rsyncStdin
-					mu.Unlock()
-
-					// Read from rsync stdout and send to WebSocket
-					go func() {
-						buf := make([]byte, 32*1024)
-						for {
-							n, err := rsyncStdout.Read(buf)
-							if err != nil {
-								if err != io.EOF {
-									logMsg("rsync read error: %v", err)
-								}
-								// rsync finished this module - reset for next module
-								logMsg("rsync module completed, ready for next")
-								mu.Lock()
-								if currentStdin != nil {
-									currentStdin.Close()
-								}
-								rsyncStarted = false
-								rsyncStdin = nil
-								mu.Unlock()
-								close(currentDone)
-								return
-							}
-							atomic.AddUint64(&bytesSent, uint64(n))
-							wsMu.Lock()
-							ws.SetWriteDeadline(time.Now().Add(30 * time.Second))
-							err = ws.WriteMessage(websocket.BinaryMessage, buf[:n])
-							wsMu.Unlock()
-							if err != nil {
-								logMsg("websocket write error: %v", err)
-								return
-							}
-						}
-					}()
-				}
-
-				// Forward data to rsync stdin
-				mu.Lock()
-				stdin := rsyncStdin
-				mu.Unlock()
-				if stdin != nil {
-					if _, err := stdin.Write(data); err != nil {
-						// rsync might have exited, wait briefly for it to reset and retry
-						time.Sleep(100 * time.Millisecond)
-						continue // retry with new rsync
-					}
-					break // success
-				} else {
-					// No stdin yet, wait and retry
-					time.Sleep(100 * time.Millisecond)
+			// Check for close signal: [255][connID]
+			if data[0] == connIDCloseMarker {
+				if len(data) < 2 {
+					logMsg("Malformed close message from server")
 					continue
+				}
+				closeConnID := data[1]
+				logMsg("Received close signal for connection %d", closeConnID)
+				mu.Lock()
+				if currentConn != nil && currentConn.connID == closeConnID {
+					if currentConn.stdin != nil {
+						currentConn.stdin.Close()
+					}
+					currentConn = nil
+				}
+				mu.Unlock()
+				continue
+			}
+
+			// Data message: [connID][data...]
+			connID := data[0]
+			payload := data[1:]
+
+			mu.Lock()
+			// Check if we need to start a new rsync (new connection ID)
+			if currentConn == nil || currentConn.connID != connID {
+				// Close old connection if exists
+				if currentConn != nil && currentConn.stdin != nil {
+					currentConn.stdin.Close()
+				}
+				mu.Unlock()
+				// Start new rsync for this connection
+				conn, err := startRsync(connID)
+				if err != nil {
+					return err
+				}
+				mu.Lock()
+				currentConn = conn
+			}
+			stdin := currentConn.stdin
+			mu.Unlock()
+
+			// Forward data to rsync stdin
+			if stdin != nil && len(payload) > 0 {
+				if _, err := stdin.Write(payload); err != nil {
+					logMsg("Failed to write to rsync stdin: %v", err)
 				}
 			}
 

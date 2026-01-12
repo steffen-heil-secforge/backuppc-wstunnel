@@ -326,7 +326,7 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 	go triggerBackup(cn)
 
 	// Channels for coordination
-	wsData := make(chan []byte, 10)
+	wsData := make(chan connData, 10)
 	wsError := make(chan error, 1)
 	tunnelDone := make(chan struct{})
 
@@ -355,8 +355,31 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if msgType == websocket.BinaryMessage {
+				// Parse connection ID prefix byte
+				if len(data) < 1 {
+					log.Printf("Received empty binary message from '%s'", cn)
+					continue
+				}
+				var cd connData
+				if data[0] == connIDCloseMarker {
+					// Close message: [255][connID]
+					if len(data) < 2 {
+						log.Printf("Malformed close message from '%s'", cn)
+						continue
+					}
+					cd = connData{
+						connID:  data[1],
+						isClose: true,
+					}
+				} else {
+					// Data message: [connID][data...]
+					cd = connData{
+						connID: data[0],
+						data:   data[1:],
+					}
+				}
 				select {
-				case wsData <- data:
+				case wsData <- cd:
 				case <-tunnelDone:
 					return
 				}
@@ -422,9 +445,10 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Handle this BackupPC connection
+		connID := byte(connectionCount % 255) // Connection ID 0-254 (255 is reserved for close marker)
 		connectionCount++
-		log.Printf("BackupPC connection #%d for '%s'", connectionCount, cn)
-		ok := handleBackupPCConnectionWithChannel(ws, conn, cn, wsData, wsError)
+		log.Printf("BackupPC connection #%d (ID %d) for '%s'", connectionCount, connID, cn)
+		ok := handleBackupPCConnectionWithChannel(ws, conn, cn, connID, wsData, wsError)
 		lastActivity = time.Now()
 		log.Printf("BackupPC connection #%d completed for '%s'", connectionCount, cn)
 		if !ok {
@@ -443,16 +467,29 @@ finished:
 	}
 }
 
+// connData represents data received from WebSocket with connection ID
+// Data messages: [connID 0-254][data...]
+// Close messages: [255][connID] (2 bytes total)
+type connData struct {
+	connID  byte
+	isClose bool
+	data    []byte
+}
+
+const connIDCloseMarker = 255 // First byte 255 indicates close signal
+
 // handleBackupPCConnectionWithChannel handles a single BackupPC TCP connection
 // using data from the shared WebSocket reader channel.
 // Returns true if connection completed normally (TCP closed),
 // false if WebSocket error occurred (should stop accepting new connections)
-func handleBackupPCConnectionWithChannel(ws *websocket.Conn, tcp net.Conn, cn string, wsData <-chan []byte, wsError <-chan error) (ok bool) {
+func handleBackupPCConnectionWithChannel(ws *websocket.Conn, tcp net.Conn, cn string, connID byte, wsData <-chan connData, wsError <-chan error) (ok bool) {
 	defer tcp.Close()
 
 	tcpDone := make(chan struct{})
+	var wsMu sync.Mutex // Protect WebSocket writes
 
 	// TCP -> WebSocket (BackupPC sending data to client)
+	// Prefix each message with connection ID byte
 	go func() {
 		defer close(tcpDone)
 		buf := make([]byte, 32*1024)
@@ -462,13 +499,26 @@ func handleBackupPCConnectionWithChannel(ws *websocket.Conn, tcp net.Conn, cn st
 				if err != io.EOF {
 					log.Printf("TCP read error for '%s': %v", cn, err)
 				}
+				// Send close signal to client: [255][connID]
+				closeMsg := []byte{connIDCloseMarker, connID}
+				wsMu.Lock()
+				ws.SetWriteDeadline(time.Now().Add(30 * time.Second))
+				ws.WriteMessage(websocket.BinaryMessage, closeMsg)
+				wsMu.Unlock()
 				return
 			}
+			// Prepend connection ID byte
+			msg := make([]byte, n+1)
+			msg[0] = connID
+			copy(msg[1:], buf[:n])
+			wsMu.Lock()
 			ws.SetWriteDeadline(time.Now().Add(30 * time.Second))
-			if err := ws.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
+			if err := ws.WriteMessage(websocket.BinaryMessage, msg); err != nil {
+				wsMu.Unlock()
 				log.Printf("WebSocket write error for '%s': %v", cn, err)
 				return
 			}
+			wsMu.Unlock()
 		}
 	}()
 
@@ -483,14 +533,25 @@ func handleBackupPCConnectionWithChannel(ws *websocket.Conn, tcp net.Conn, cn st
 			log.Printf("BackupPC connection closed for '%s'", cn)
 			return true
 
-		case data, ok := <-wsData:
+		case cd, ok := <-wsData:
 			if !ok {
 				// Channel closed - WebSocket reader exited
 				log.Printf("WebSocket channel closed for '%s'", cn)
 				return false
 			}
+			// Only process data for our connection ID
+			if cd.connID != connID {
+				// Data for different connection - shouldn't happen in sequential mode
+				log.Printf("Received data for connection %d but handling %d for '%s'", cd.connID, connID, cn)
+				continue
+			}
+			// Handle close signal from client
+			if cd.isClose {
+				log.Printf("Received close signal for connection %d from '%s'", connID, cn)
+				return true
+			}
 			tcp.SetWriteDeadline(time.Now().Add(30 * time.Second))
-			if _, err := tcp.Write(data); err != nil {
+			if _, err := tcp.Write(cd.data); err != nil {
 				log.Printf("TCP write error for '%s': %v", cn, err)
 				return true // TCP error, but WebSocket is fine - can continue with next connection
 			}
