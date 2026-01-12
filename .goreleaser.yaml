@@ -1,0 +1,118 @@
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: server
+    main: ./cmd/server
+    binary: backuppc-tunnel-server
+    goos:
+      - linux
+    goarch:
+      - amd64
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
+  - id: client-linux
+    main: ./cmd/client
+    binary: backuppc-tunnel-client
+    goos:
+      - linux
+    goarch:
+      - amd64
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
+  - id: client-windows
+    main: ./cmd/client
+    binary: backuppc-tunnel-client
+    goos:
+      - windows
+    goarch:
+      - amd64
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
+archives:
+  - id: client-windows-zip
+    ids:
+      - client-windows
+    formats:
+      - zip
+    name_template: "backuppc-tunnel-client-windows-amd64"
+
+  - id: linux-binaries
+    ids:
+      - server
+      - client-linux
+    formats:
+      - binary
+
+nfpms:
+  - id: server
+    package_name: backuppc-tunnel-server
+    ids:
+      - server
+    vendor: BackupPC
+    homepage: https://github.com/steffen-heil-secforge/backuppc-wstunnel
+    maintainer: Steffen Heil <steffen.heil@secforge.de>
+    description: WebSocket tunnel server for BackupPC client-initiated backups
+    license: MIT
+    formats:
+      - deb
+    bindir: /usr/local/bin
+    contents:
+      - src: config/backuppc-tunnel.service
+        dst: /etc/systemd/system/backuppc-tunnel.service
+        type: config
+      - src: scripts/init-ca.sh
+        dst: /usr/share/backuppc-tunnel/init-ca.sh
+        file_info:
+          mode: 0755
+      - src: scripts/register-client.sh
+        dst: /usr/share/backuppc-tunnel/register-client.sh
+        file_info:
+          mode: 0755
+    scripts:
+      postinstall: scripts/server-postinstall.sh
+      preremove: scripts/server-preremove.sh
+      postremove: scripts/server-postremove.sh
+
+  - id: client
+    package_name: backuppc-tunnel-client
+    ids:
+      - client-linux
+    vendor: BackupPC
+    homepage: https://github.com/steffen-heil-secforge/backuppc-wstunnel
+    maintainer: Steffen Heil <steffen.heil@secforge.de>
+    description: WebSocket tunnel client for BackupPC client-initiated backups
+    license: MIT
+    formats:
+      - deb
+    bindir: /usr/local/bin
+    scripts:
+      postinstall: scripts/client-postinstall.sh
+
+checksum:
+  name_template: 'checksums.txt'
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+
+release:
+  github:
+    owner: steffen-heil-secforge
+    name: backuppc-wstunnel

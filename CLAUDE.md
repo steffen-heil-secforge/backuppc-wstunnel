@@ -5,18 +5,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build Commands
 
 ```bash
-make all              # Build server + Linux/Windows clients
+# Development (quick local builds)
+make all              # Build server + Linux/Windows clients to bin/
 make server           # Build Linux server only
 make client-linux     # Build Linux client only
 make client-windows   # Build Windows client only
-make clean            # Remove build artifacts
-make deps             # Download and tidy dependencies
+
+# Release builds (via GoReleaser)
+goreleaser build --snapshot --clean    # Build all to dist/
+goreleaser release --snapshot --clean  # Full release (no publish)
+goreleaser release --clean             # Actual release (requires tag)
 ```
 
-Binaries are output to `bin/`:
-- `backuppc-tunnel-server` (Linux)
-- `backuppc-tunnel-client` (Linux)
-- `backuppc-tunnel-client.exe` (Windows)
+Binaries output to `bin/` (make) or `dist/` (goreleaser)
 
 ## Architecture
 
